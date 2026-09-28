@@ -78,8 +78,8 @@ interruption. A stale cache from different inputs/code/config raises instead of 
 ## 3b. Stage-2 — rebuild the final v8 file (needs the stage-1 run above)
 
 ```bash
-cd stage2 && ./run_v7.sh   # ~6-8 h on 2x L40S, CE steps dominate; then:
-python combine8b.py OUT v8inus 0.75 blend64 0.8 0.65 0.95 0.5
+./code/business_entity_resolution/stage2/run_v7.sh [OUT]   # ~6-8 h on 2x L40S, CE steps dominate; then:
+python code/business_entity_resolution/stage2/combine8b.py OUT v8inus 0.75 blend64 0.8 0.65 0.95 0.5
 ```
 
 Details in `stage2/README.md`: stage-1 is a filter (p >= 0.003); stage-2 trains

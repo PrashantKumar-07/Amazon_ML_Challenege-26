@@ -1,7 +1,11 @@
 """Cross-encoder features: logit + record-side context (gap to the record's best other candidate, rank).
 Context is computed only over the rows each view scores (train 'in': v4 p>=T; train 'loco': LOCO p>=T; test: all)."""
-import sys, numpy as np, pandas as pd
-D = "/data/nishant/Nishant/Prashant/AmazonML26/work_v5/data"
+import os, sys
+from pathlib import Path
+import numpy as np, pandas as pd
+ROOT = Path(os.environ.get("BER_ROOT", Path(__file__).resolve().parent.parent.parent.parent))
+W5 = Path(os.environ.get("BER_W5", ROOT / "work" / "stage2"))
+D = str(W5 / "data")
 T = 0.003
 
 

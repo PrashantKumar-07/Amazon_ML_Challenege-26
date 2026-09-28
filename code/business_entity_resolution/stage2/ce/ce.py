@@ -3,11 +3,15 @@ train  : python ce.py train   --split train --sel "fold2==0" --out DIR
 predict: python ce.py predict --split train|test --sel "fold2==1" --model DIR --out scores.npy
 --sel is evaluated on the reduced-table meta arrays (fold2, fold5, cty, y, p4, ploco)."""
 import argparse, math, os, time, json
+from pathlib import Path
 import numpy as np, polars as pl, torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
 
-os.environ.setdefault("HF_HOME", "/data/nishant/Nishant/Prashant/AmazonML26/models_hf")
-W, D = "/data/nishant/Nishant/Prashant/AmazonML26/work_v4", "/data/nishant/Nishant/Prashant/AmazonML26/work_v5/data"
+ROOT = Path(os.environ.get("BER_ROOT", Path(__file__).resolve().parent.parent.parent.parent.parent))
+W4 = Path(os.environ.get("BER_W4", ROOT / "work" / "stage1"))
+W5 = Path(os.environ.get("BER_W5", ROOT / "work" / "stage2"))
+os.environ.setdefault("HF_HOME", str(ROOT / "models_hf"))
+W, D = str(W4), str(W5 / "data")
 BASE = os.environ.get("CE_BASE", "intfloat/multilingual-e5-small")
 MAXLEN = 128
 T0 = time.time()

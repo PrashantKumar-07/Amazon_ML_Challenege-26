@@ -1,16 +1,18 @@
 """v5: stage-2 XGBoost on the v4-filtered hard pairs (v4 p>=0.003; v4 p is a filter only, never a feature),
 5 folds grouped by S1, test = mean of the fold models; decision + writer from the production pipeline.
-python final.py --extra a,b,... --thr 0.8 --out /data/nishant/Nishant/Prashant/AmazonML26/output_v5"""
-import argparse, json, subprocess, sys, time
+python final.py --extra a,b,... --thr 0.8 --out <out-dir>"""
+import argparse, json, os, subprocess, sys, time
 from pathlib import Path
 import numpy as np, pandas as pd, xgboost as xgb
-sys.path.insert(0, "/data/nishant/Nishant/Prashant/AmazonML26/code/business_entity_resolution")
-sys.path.insert(0, "/data/nishant/Nishant/Prashant/AmazonML26/work_v5")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.pipeline import write_outputs
 from exp import load, fit, score, T, log
 
-D = Path("/data/nishant/Nishant/Prashant/AmazonML26/work_v5/data")
-W4 = Path("/data/nishant/Nishant/Prashant/AmazonML26/work_v4")
+ROOT = Path(os.environ.get("BER_ROOT", Path(__file__).resolve().parent.parent.parent.parent))
+W4 = Path(os.environ.get("BER_W4", ROOT / "work" / "stage1"))
+W5 = Path(os.environ.get("BER_W5", ROOT / "work" / "stage2"))
+D = W5 / "data"
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--extra", default=""); ap.add_argument("--tag", default="v5"); ap.add_argument("--drop", default="")
@@ -32,7 +34,7 @@ if extra:
     Xt = np.hstack([Xt] + [np.load(D / f"extra_{e}_test.npy").astype(np.float32)[:, None] for e in extra])
 assert Xt.shape[1] == X.shape[1]
 oof = np.zeros(len(y), np.float32); pt = np.zeros(len(Xt), np.float64); its = []
-mdir = Path("/data/nishant/Nishant/Prashant/AmazonML26/work_v5/models_final") / a.tag; mdir.mkdir(parents=True, exist_ok=True)
+mdir = W5 / "models_final" / a.tag; mdir.mkdir(parents=True, exist_ok=True)
 for k in range(5):
     b, it = fit(X, y, si, np.flatnonzero((f5 != k) & in_rows), params, a.dev); its.append(it)
     ev = np.flatnonzero((f5 == k) & in_rows)
@@ -49,5 +51,5 @@ pp = D / f"test_pred_{a.tag}.parquet"; pred.to_parquet(pp, index=False)
 write_outputs(W4 / "cache", W4 / "test" / "cands.parquet", pp, {"rule": "threshold", "t": a.thr}, out)
 r = subprocess.run([sys.executable, "utils/validate_submission.py", "--matching", str(out / "matching_results.tsv"),
                     "--candidate", str(out / "candidate_pairs.tsv"), "--test-dir", "dataset/test"],
-                   cwd="/data/nishant/Nishant/Prashant/AmazonML26/student_resource", capture_output=True, text=True)
+                   cwd=str(ROOT / "student_resource"), capture_output=True, text=True)
 print(r.stdout[-2000:], r.stderr[-2000:])

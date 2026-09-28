@@ -2,13 +2,17 @@
 S1 of a country absent from training -> no-CE model (capop, thr 0.7; selected on leave-one-country-out).
 The seen-country set is read from the train S1 table (no country names in code)."""
 import shutil, subprocess, sys
+import os
 from pathlib import Path
 import numpy as np, pandas as pd, polars as pl
-sys.path.insert(0, "/data/nishant/Nishant/Prashant/AmazonML26/code/business_entity_resolution")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.decide import best_per_record, assign_threshold
 from src.io_utils import MATCH_HEADER, write_id_lists
 
-W4 = Path("/data/nishant/Nishant/Prashant/AmazonML26/work_v4"); D = Path("/data/nishant/Nishant/Prashant/AmazonML26/work_v5/data")
+ROOT = Path(os.environ.get("BER_ROOT", Path(__file__).resolve().parent.parent.parent.parent))
+W4 = Path(os.environ.get("BER_W4", ROOT / "work" / "stage1"))
+W5 = Path(os.environ.get("BER_W5", ROOT / "work" / "stage2"))
+D = W5 / "data"
 OUT = Path(sys.argv[1]); SEEN_T = 0.75; UNSEEN_T = float(sys.argv[2]) if len(sys.argv) > 2 else 0.7
 UNSEEN_TAG = sys.argv[3] if len(sys.argv) > 3 else "capop"
 SEEN_TAG = sys.argv[4] if len(sys.argv) > 4 else "capce"
@@ -34,7 +38,11 @@ groups = {s1.id.values[si[x]]: rec_ids[ri[x:y]] for x, y in zip(cut, np.r_[cut[1
 write_id_lists(OUT / "matching_results.tsv", MATCH_HEADER, s1.id.values, groups)
 cp = OUT / "candidate_pairs.tsv"
 if not cp.exists():
-    shutil.copy2("/data/nishant/Nishant/Prashant/AmazonML26/output_v6/candidate_pairs.tsv", cp)
+    fb = ROOT / "output" / "candidate_pairs.tsv"
+    if fb.exists():
+        shutil.copy2(fb, cp)
+    else:
+        print(f"note: {cp} not written; copy the stage-1 candidate file here before validating")
 nm = np.bincount(a.si.values, minlength=len(s1))
 for c in sorted(s1.country.unique()):
     m = s1.country.values == c
@@ -42,5 +50,5 @@ for c in sorted(s1.country.unique()):
 print(f"wrote {len(a):,} matches for {len(s1):,} S1")
 r = subprocess.run([sys.executable, "utils/validate_submission.py", "--matching", str(OUT / "matching_results.tsv"),
                     "--candidate", str(cp), "--test-dir", "dataset/test", "--check-ids"],
-                   cwd="/data/nishant/Nishant/Prashant/AmazonML26/student_resource", capture_output=True, text=True)
+                   cwd=str(ROOT / "student_resource"), capture_output=True, text=True)
 print(r.stdout[-1500:], r.stderr[-1500:])

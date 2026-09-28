@@ -2,8 +2,7 @@
 
 Prerequisite: a stage-1 pipeline run (`python -m src.pipeline --mode full`,
 which provides caches, candidates, 89 features and stage-1 test/OOF predictions).
-Stage-2 re-scores the hard pairs only. Design and every validation number are in
-`work/EXPERIMENT_LOG.md` (not in git; kept locally).
+Stage-2 re-scores the hard pairs only.
 
 - **Stage 1 (src, filter only):** XGBoost on 89 features. Pairs with stage-1
   p >= 0.003 go to stage-2 (keeps 99.986% of true pairs in-country,
@@ -30,10 +29,32 @@ Stage-2 re-scores the hard pairs only. Design and every validation number are in
   **v8 0.990** (seen blend + unseen house-number gate). v9 0.984 (stronger gate,
   rejected — beyond the LOCO optimum); v10 = v8 + 1 pair (ownership offset has
   no effect).
-- **Reproduce:** `./run_v7.sh` rebuilds the v6/v7 predictions from the stage-1
-  caches (~6–8 h on 2× L40S, CE steps dominate); then run the v8 blend + gate
-  (`combine8b.py`). CE checkpoints (~6 GB) and `work/` tables are not in git;
-  retrain from the HF bases (see `ce/ce.py`, `final.py`, `exp.py`).
-- **Known limitations:** absolute paths; CE folds (2) are not nested inside the
-  stage-2 folds (5); bf16 CE logits saturate near 10; the gate thresholds were
-  set on the LOCO proxy + LB moves, not on plain OOF.
+
+## Reproduce
+
+```bash
+./code/business_entity_resolution/stage2/run_v7.sh [OUT]   # ~6-8 h on 2x L40S, CE steps dominate
+```
+
+Paths are portable (no machine-specific strings). Defaults assume this layout;
+override with environment variables:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `BER_ROOT` | repository root | derived from the script location |
+| `BER_W4` | stage-1 work dir (`cache/`, `train/`, `test/` from `src.pipeline`) | `<root>/work/stage1` |
+| `BER_W5` | stage-2 work dir (reduced tables, CE scores, stage-2 models) | `<root>/work/stage2` |
+| `BER_PY` | python interpreter (run script only) | `<root>/.venv/bin/python` |
+| `HF_HOME` | Hugging Face cache | `<root>/models_hf` |
+
+`build_reduced.py` additionally unions LOCO-only hard rows from the experiment
+harness (`BER_HARNESS_DATA`, `BER_HARNESS_LOCO`); without it, rebuild the tables
+from the stage-1 filter only. CE checkpoints (~6 GB) and `work/` tables are not
+in git; retrain from the HF bases (`ce/ce.py`, `final.py`, `exp.py`).
+
+## Known limitations
+
+- The cross-encoder folds (2) are not nested inside the stage-2 folds (5).
+- bf16 CE logits saturate near 10.
+- The gate thresholds were set on the LOCO proxy plus the LB moves, not on
+  plain OOF.

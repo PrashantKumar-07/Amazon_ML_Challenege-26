@@ -6,11 +6,16 @@ described by country-invariant, label-free statistics learned per split and per 
   first : share of the token's S1 occurrences in the first position   (prefix-like)
 python opfeats.py train|test"""
 import sys, numpy as np, polars as pl
+import os
+from pathlib import Path
 from collections import Counter
 from multiprocessing import Pool
 from rapidfuzz.distance import Levenshtein
 
-W, D = "/data/nishant/Nishant/Prashant/AmazonML26/work_v4", "/data/nishant/Nishant/Prashant/AmazonML26/work_v5/data"
+ROOT = Path(os.environ.get("BER_ROOT", Path(__file__).resolve().parent.parent.parent.parent))
+W4 = Path(os.environ.get("BER_W4", ROOT / "work" / "stage1"))
+W5 = Path(os.environ.get("BER_W5", ROOT / "work" / "stage2"))
+W, D = str(W4), str(W5 / "data")
 COLS = ["o_nins", "o_ndel", "o_nsub", "o_ins_novel", "o_ins_qmax", "o_ins_qmin", "o_ins_lastmax", "o_ins_firstmax",
         "o_del_qmax", "o_del_qmin", "o_del_lastmax", "o_del_firstmax", "o_ins_at_end", "o_ins_at_start",
         "o_del_s1last", "o_ins_frac", "o_del_frac", "o_order_swap"]

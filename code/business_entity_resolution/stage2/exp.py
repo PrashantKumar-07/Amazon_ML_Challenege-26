@@ -4,12 +4,15 @@ Views (all scored with the exact macro F0.5 over ALL train S1; pairs outside the
   clone : 'in' predictions + each unmatched record duplicated w.p. 0.9 (test-like distractor density)
   loco  : train on one country (its in-country rows), predict the other on rows with LOCO stage-1 p>=T
 python exp.py --tag T [--drop feat,...] [--extra ce_a,...] [--views in,loco] [--dev cuda:0]"""
-import argparse, json, sys, time
+import argparse, json, os, sys, time
+from pathlib import Path
 import numpy as np, pandas as pd, xgboost as xgb
-sys.path.insert(0, "/data/nishant/Nishant/Prashant/AmazonML26/code/business_entity_resolution")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.decide import best_per_record, assign_threshold, score_rows
 
-D = "/data/nishant/Nishant/Prashant/AmazonML26/work_v5/data"
+ROOT = Path(os.environ.get("BER_ROOT", Path(__file__).resolve().parent.parent.parent.parent))
+W5 = Path(os.environ.get("BER_W5", ROOT / "work" / "stage2"))
+D = str(W5 / "data")
 T = 0.003
 THRS = [0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
 T0 = time.time()
@@ -143,7 +146,7 @@ def main():
         r = score(ri, si, p, true_si, cty_s1); r.insert(0, "view", "loco"); res.append(r)
     res = pd.concat(res); res.insert(0, "tag", a.tag)
     print(res.round(5).to_string(), flush=True)
-    res.to_csv(f"/data/nishant/Nishant/Prashant/AmazonML26/work_v5/res_{a.tag}.csv", index=False)
+    res.to_csv(W5 / f"res_{a.tag}.csv", index=False)
 
 
 if __name__ == "__main__":

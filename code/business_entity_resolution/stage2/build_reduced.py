@@ -1,11 +1,17 @@
 """Build the reduced hard-pair tables (stage-2 universe) for train and test.
 train rows: v4 OOF p >= T  OR  v4-config LOCO p >= T  (LOCO preds come from the harness table, joined on (ri, si)).
 test rows : v4 test p >= T.  Stage-1 (v4) probability is used ONLY as a filter, never as a feature."""
-import sys, numpy as np, polars as pl, pyarrow.parquet as pq, json
-sys.path.insert(0, "code/business_entity_resolution")
+import os, sys
+from pathlib import Path
+import numpy as np, polars as pl, pyarrow.parquet as pq, json
+ROOT = Path(os.environ.get("BER_ROOT", Path(__file__).resolve().parent.parent.parent.parent))
+PKG = ROOT / "code" / "business_entity_resolution"
+sys.path.insert(0, str(PKG))
 from src.model import aligned_batches, fold_of
 T = 0.003
-W, O = "work_v4", "work_v5/data"
+W4 = Path(os.environ.get("BER_W4", ROOT / "work" / "stage1"))
+W5 = Path(os.environ.get("BER_W5", ROOT / "work" / "stage2"))
+W, O = str(W4), str(W5 / "data")
 cols = json.load(open("work_v5/data/cols.json")) if False else None
 import xgboost as xgb
 FEATS = xgb.Booster(model_file=f"{W}/models/xgb_fold0.ubj").feature_names
@@ -30,8 +36,9 @@ def extract(split, mask):
 
 # train
 o = pl.read_parquet(f"{W}/train/oof.parquet", columns=["ri", "si", "p"]).with_row_index("row")
-TD = "work/agents/tuner/data"
-lp = np.load("work/exp2/preds/loco_v2_es_base.npy")
+# LOCO harness tables (experiment-only; not in git). Needed to union the LOCO-only hard rows.
+TD = Path(os.environ.get("BER_HARNESS_DATA", ROOT / "work" / "harness" / "tuner" / "data"))
+lp = np.load(Path(os.environ.get("BER_HARNESS_LOCO", ROOT / "work" / "harness" / "loco_v2_es_base.npy")))
 h = pl.DataFrame({"ri": np.load(f"{TD}/ri_train.npy"), "si": np.load(f"{TD}/si_train.npy"), "p_loco": lp})
 o = o.join(h, on=["ri", "si"], how="left")
 print("v4 rows without a harness LOCO p:", o["p_loco"].null_count())
