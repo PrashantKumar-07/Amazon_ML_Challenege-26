@@ -177,7 +177,7 @@ def test_aligned_batches_across_row_group_layouts(tmp_path):
     from src.model import aligned_batches, select_rows
     n = 10_007
     a = pa.table({"ri": np.arange(n), "si": np.arange(n) * 2, "f1": np.arange(n, dtype=np.float32)})
-    b = pa.table({"x1": np.arange(n, dtype=np.float32) * 3})
+    b = pa.table({"ri": np.arange(n), "si": np.arange(n) * 2, "x1": np.arange(n, dtype=np.float32) * 3})
     pq.write_table(a, tmp_path / "a.parquet", row_group_size=997)
     pq.write_table(b, tmp_path / "b.parquet", row_group_size=3001)
     paths = [tmp_path / "a.parquet", tmp_path / "b.parquet"]
@@ -186,6 +186,12 @@ def test_aligned_batches_across_row_group_layouts(tmp_path):
     keep = np.zeros(n, bool); keep[::7] = True
     s = select_rows(paths, keep, batch_rows=500)
     assert (s.ri.values == np.flatnonzero(keep)).all() and (s.x1.values == s.ri.values * 3).all()
-    with pytest.raises(ValueError):
-        pq.write_table(b.slice(0, n - 1), tmp_path / "c.parquet")
+    pq.write_table(b.slice(0, n - 1), tmp_path / "c.parquet")
+    with pytest.raises(ValueError, match="not row-aligned"):                      # different length
         next(aligned_batches([tmp_path / "a.parquet", tmp_path / "c.parquet"]))
+    pq.write_table(b.take(np.arange(n)[::-1]), tmp_path / "d.parquet")        # same rows, reversed order
+    with pytest.raises(ValueError, match="pair keys differ"):
+        list(aligned_batches([tmp_path / "a.parquet", tmp_path / "d.parquet"], batch_rows=1000))
+    pq.write_table(b.drop(["ri", "si"]), tmp_path / "e.parquet")                # no keys at all
+    with pytest.raises(ValueError, match="missing pair keys"):
+        next(aligned_batches([tmp_path / "a.parquet", tmp_path / "e.parquet"]))

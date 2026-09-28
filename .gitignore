@@ -7,9 +7,14 @@ work_*/
 .venv/
 __pycache__/
 *.pyc
+*.parquet
+*.npy
+# HF model cache (multi-GB, re-downloaded / fine-tuned by the pipeline)
+models_hf/
 # over GitHub's 100 MB file limit (2.4 GB) — kept locally / goes in the final zip
 output/candidate_pairs.tsv
-# internal working notes
+# internal working notes and local versioned outputs
 PLAN.md
 output_v*/
+archive/
 .pytest_cache/

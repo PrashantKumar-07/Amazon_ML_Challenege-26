@@ -1,6 +1,8 @@
 """Read raw TSVs, normalise, cache to parquet: <cache>/<split>_s{1,2,3}.parquet."""
 import argparse
+import json
 import os
+import shutil
 import time
 from multiprocessing import Pool
 from pathlib import Path
@@ -8,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from . import fingerprint as fpr
 from . import token_map
 from .io_utils import gt_pairs, read_ground_truth, read_source
 from .normalize import digits, has_non_latin, norm_addr, norm_name
@@ -48,13 +51,13 @@ def build_token_map(data_dir: Path, cache: Path) -> dict:
     recs = recs[recs.name_nonlatin].set_index("id").name_raw
     pairs = gt_pairs(read_ground_truth(data_dir / "train" / "train_ground_truth.tsv"))
     pairs = pairs[pairs.rid.isin(recs.index)]
-    return learn_token_map(s1.reindex(pairs.s1).values, recs.reindex(pairs.rid).values)
+    return learn_token_map(s1.reindex(pairs.s1).values, recs.reindex(pairs.rid).values, entity_ids=pairs.s1.values)
 
 
 def apply_map_to_cache(path: Path, tmap: dict):
     df = pd.read_parquet(path)
     if "name_mapped" in df.columns:
-        return
+        raise fpr.StaleArtifact(f"{path} is already mapped but its metadata says otherwise; use a new --work")
     m = df.name_nonlatin.values
     df["name_mapped"] = False
     df.loc[m, "name"] = [norm_name(apply_token_map(x, tmap)) for x in df.name_raw.values[m]]
@@ -72,32 +75,66 @@ def main():
                     help="pre-learned token_map.json (required when train is not among --splits)")
     args = ap.parse_args()
     splits = [x for x in args.splits.split(",") if x]
-    cache = Path(args.cache)
+    data, cache = Path(args.data_dir), Path(args.cache)
     cache.mkdir(parents=True, exist_ok=True)
+    code = fpr.code_digest("normalize", "preprocess", "token_map", "io_utils")
+    src = lambda split, s: data / split / f"{split}_source{s}.tsv"
+    fp_norm = lambda split, s: fpr.fingerprint(stage="normalise", data=fpr.file_digest(src(split, s)), code=code)
+
+    # 1) normalised caches (fingerprint of data + code; the token map is applied in step 3)
     for split in splits:
         for s in (1, 2, 3):
             dst = cache / f"{split}_s{s}.parquet"
             if dst.exists():
-                continue
+                got = fpr.read(dst)
+                if got is not None and json.loads(fpr.meta_path(dst).read_text()).get("norm") == fp_norm(split, s):
+                    continue
+                raise fpr.StaleArtifact(f"{dst} was produced by different data or code; delete the cache or use a "
+                                        f"new --work")
             t = time.time()
-            df = read_source(Path(args.data_dir) / split / f"{split}_source{s}.tsv")
+            df = read_source(src(split, s))
             normalise_df(df, args.workers).to_parquet(dst, index=False)
+            fpr.write(dst, fp_norm(split, s), norm=fp_norm(split, s), mapped=None)
             print(f"{dst.name}: {len(df):,} rows in {time.time() - t:.0f}s", flush=True)
 
+    # 2) token map: learned from train pairs, or given; a given map must not silently lose to a cached one
     map_path = cache / "token_map.json"
-    if args.token_map and not map_path.exists():
-        token_map.save(token_map.load(args.token_map), map_path)
+    if args.token_map:
+        given = Path(args.token_map)
+        if map_path.exists() and fpr.full_digest(map_path) != fpr.full_digest(given):
+            raise fpr.StaleArtifact(f"{map_path} differs from --token-map {given}; use a new --work")
+        if not map_path.exists():
+            shutil.copyfile(given, map_path)                    # byte copy: digest comparable to --token-map
+            fpr.write(map_path, "given:" + fpr.full_digest(given))
+    learned_fp = None
+    if "train" in splits and not args.token_map:
+        learned_fp = fpr.fingerprint(stage="token_map", code=code, gt=fpr.file_digest(data / "train" / "train_ground_truth.tsv"),
+                                     train=[fp_norm("train", s) for s in (1, 2, 3)])
     if map_path.exists():
+        if learned_fp is not None:
+            fpr.check_reusable(map_path, learned_fp)
         tmap = token_map.load(map_path)
     else:
         if "train" not in splits:
             raise ValueError("no token map: pass --token-map or include the train split")
-        tmap = build_token_map(Path(args.data_dir), cache)
+        tmap = build_token_map(data, cache)
         token_map.save(tmap, map_path)
+        fpr.write(map_path, learned_fp)
+    tm_digest = fpr.full_digest(map_path)
     print(f"token map: {len(tmap):,} entries", flush=True)
+
+    # 3) apply the map; the final fingerprint of each cache file covers data, code and map
     for split in splits:
         for s in (1, 2, 3):
-            apply_map_to_cache(cache / f"{split}_s{s}.parquet", tmap)
+            dst = cache / f"{split}_s{s}.parquet"
+            meta = json.loads(fpr.meta_path(dst).read_text())
+            final = fpr.fingerprint(norm=meta["norm"], token_map=tm_digest)
+            if meta.get("mapped") == tm_digest:
+                continue
+            if meta.get("mapped") is not None:
+                raise fpr.StaleArtifact(f"{dst} was mapped with a different token map; use a new --work")
+            apply_map_to_cache(dst, tmap)
+            fpr.write(dst, final, norm=meta["norm"], mapped=tm_digest)
     print("token map applied", flush=True)
 
 

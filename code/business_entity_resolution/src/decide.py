@@ -4,8 +4,13 @@ import pandas as pd
 
 
 def best_per_record(pr: pd.DataFrame) -> pd.DataFrame:
-    """For each record keep its highest-probability candidate (each record belongs to <= 1 S1)."""
-    order = np.lexsort((-pr.p.values, pr.ri.values))
+    """For each record keep its highest-probability candidate (each record belongs to <= 1 S1).
+    Ties are broken by the lower S1 row, so the result does not depend on the input row order."""
+    if len(pr) == 0:
+        out = pr.iloc[:0].copy()
+        out["p2"] = np.zeros(0, dtype=np.float32)
+        return out.reset_index(drop=True)
+    order = np.lexsort((pr.si.values, -pr.p.values, pr.ri.values))
     d = pr.iloc[order]
     first = np.r_[True, d.ri.values[1:] != d.ri.values[:-1]]
     best = d[first].copy()
@@ -25,6 +30,8 @@ def assign_threshold(best: pd.DataFrame, t: float) -> pd.DataFrame:
 def assign_hybrid(pr, best, n_s1, p_min: float, gate: float, mass_scale: float = 1.0, n_hat=None):
     """Expected-F0.5 set size, but an S1 stays empty unless its best assigned record has p >= gate."""
     a = assign_expected_f(pr, best, n_s1, p_min=p_min, mass_scale=mass_scale, use_empty=False, n_hat=n_hat)
+    if len(a) == 0:
+        return a
     top = pd.Series(a.p.values).groupby(a.si.values).transform("max").values
     return a[top >= gate]
 
@@ -45,7 +52,9 @@ def assign_expected_f(pr: pd.DataFrame, best: pd.DataFrame, n_s1: int, p_min: fl
     n_hat = mass_scale * n_hat
 
     b = best[best.p.values >= p_min]
-    order = np.lexsort((-b.p.values, b.si.values))
+    if len(b) == 0:
+        return b
+    order = np.lexsort((b.ri.values, -b.p.values, b.si.values))
     b = b.iloc[order].reset_index(drop=True)
     si, p = b.si.values, b.p.values.astype(np.float64)
     start = np.r_[True, si[1:] != si[:-1]]

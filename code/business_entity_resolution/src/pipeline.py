@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import blocking, features, model, xfeatures
+from . import blocking, features, fingerprint as fpr, model, xfeatures
 from .decide import assign_hybrid, assign_threshold, best_per_record, score_rows
 from .io_utils import CAND_HEADER, MATCH_HEADER, write_id_lists
 
@@ -27,13 +27,17 @@ MODEL = {"n_folds": 5, "neg_rate": 0.5, "rounds": 3000, "params": {"learning_rat
 DECISION = {"rule": "threshold", "t": 0.8}
 
 
-def step(name, path: Path, fn):
-    if path.exists():
-        print(f"[skip] {name}: {path}", flush=True)
-        return
+def step(name, path: Path, fn, fp: str) -> str:
+    """Run fn unless path exists with the same fingerprint; a cached output from different inputs, code or
+    configuration raises instead of being reused. Returns the fingerprint (chained into downstream stages)."""
+    if fpr.check_reusable(path, fp):
+        print(f"[skip] {name}: {path} (fingerprint {fp})", flush=True)
+        return fp
     t = time.time()
     fn()
+    fpr.write(path, fp, stage=name)
     print(f"[done] {name} in {time.time() - t:.0f}s", flush=True)
+    return fp
 
 
 def apply_decision(pr: pd.DataFrame, decision: dict, n_s1: int, n_hat=None) -> pd.DataFrame:
@@ -75,6 +79,8 @@ def write_outputs(cache: Path, cands_path: Path, pred_path: Path, decision: dict
                               for s in (2, 3)])
 
     def group(si, ri):
+        if len(si) == 0:                            # e.g. no accepted match at all
+            return {}
         order = np.argsort(si, kind="stable")
         si, ri = si[order], ri[order]
         cut = np.flatnonzero(np.r_[True, si[1:] != si[:-1]])
@@ -110,6 +116,8 @@ def main():
                          "(read in inference mode, written in full mode if given)")
     ap.add_argument("--threads", type=int, default=64)
     ap.add_argument("--gpus", default="cuda:0,cuda:1", help="comma-separated CUDA devices; '' = CPU only")
+    ap.add_argument("--until", choices=["features", "all"], default="all",
+                    help="features: stop after the feature stages (resume later; cached stages are reused)")
     a = ap.parse_args()
     gpus = [d for d in a.gpus.split(",") if d]
     blocking.DEVICES[:] = gpus            # empty -> CPU sparse top-k
@@ -128,27 +136,43 @@ def main():
         cmd += ["--splits", "test", "--token-map", str(art / "token_map.json")]
     subprocess.run(cmd, check=True, cwd=Path(__file__).resolve().parents[1])
 
+    code = lambda *m: fpr.code_digest(*m)
+    cache_fp = {sp: [fpr.read(cache / f"{sp}_s{s}.parquet") for s in (1, 2, 3)] for sp in ("train", "test")}
+    feat_fp = {}
     for split in (("test",) if inference else ("train", "test")):
         cp = work / split / "cands.parquet"
-        step(f"blocking {split}", cp, lambda: blocking.run(cache, split, cp, 10, a.threads))
+        f_blk = step(f"blocking {split}", cp, lambda: blocking.run(cache, split, cp, 10, a.threads),
+                     fpr.fingerprint(stage="blocking", cache=cache_fp[split], code=code("blocking"), k=10))
         fp = work / split / "feats.parquet"
-        step(f"features {split}", fp, lambda: features.build(cache, split, cp, fp,
-                                                             gt if split == "train" else None, a.threads))
+        gt_fp = fpr.file_digest(gt) if split == "train" else None
+        f_ft = step(f"features {split}", fp, lambda: features.build(cache, split, cp, fp,
+                                                                    gt if split == "train" else None, a.threads),
+                    fpr.fingerprint(stage="features", up=f_blk, gt=gt_fp, code=code("features", "io_utils")))
         xp = work / split / "xfeats.parquet"
-        step(f"token features {split}", xp, lambda: xfeatures.build(cache, split, cp, xp, a.threads))
+        f_xf = step(f"token features {split}", xp, lambda: xfeatures.build(cache, split, cp, xp, a.threads),
+                    fpr.fingerprint(stage="xfeatures", up=f_blk, code=code("xfeatures", "features")))
+        feat_fp[split] = [f_ft, f_xf]
+    if a.until == "features":
+        print("stopping after the feature stages (--until features)")
+        return
     if inference:
         models, dec = art / "models", art / "decision.json"
+        model_fp = fpr.fingerprint(models=[fpr.full_digest(f) for f in sorted(models.glob("xgb_fold*"))])
     else:
         models, dec = work / "models", work / "decision.json"
         oof = work / "train" / "oof.parquet"
-        step("train + OOF", oof, lambda: model.oof(feat_paths("train"), oof, models, MODEL["n_folds"],
-                                                   MODEL["neg_rate"], MODEL["rounds"], model_devs, MODEL["params"],
-                                                   MODEL["es_frac"]))
-        step("decision tuning", dec, lambda: tune_decision(oof, cache, gt, dec))
+        model_fp = step("train + OOF", oof,
+                        lambda: model.oof(feat_paths("train"), oof, models, MODEL["n_folds"], MODEL["neg_rate"],
+                                          MODEL["rounds"], model_devs, MODEL["params"], MODEL["es_frac"],
+                                          upstream=fpr.fingerprint(up=feat_fp["train"])),
+                        fpr.fingerprint(stage="oof", up=feat_fp["train"], code=code("model"), model=MODEL))
+        step("decision tuning", dec, lambda: tune_decision(oof, cache, gt, dec),
+             fpr.fingerprint(stage="decision", up=model_fp, code=code("decide", "pipeline"), decision=DECISION))
         if art is not None:
             export_artifacts(work, art)
     pred = work / "test" / "pred.parquet"
-    step("test prediction", pred, lambda: model.predict(feat_paths("test"), pred, models, model_devs))
+    step("test prediction", pred, lambda: model.predict(feat_paths("test"), pred, models, model_devs),
+         fpr.fingerprint(stage="predict", up=feat_fp["test"], models=model_fp, code=code("model")))
     write_outputs(cache, work / "test" / "cands.parquet", pred, json.load(open(dec)), out)
 
 

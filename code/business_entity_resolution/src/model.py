@@ -17,6 +17,10 @@ import xgboost as xgb
 
 NON_FEATURES = {"ri", "si", "y", "fold", "p"}
 
+
+class StaleModels(RuntimeError):
+    pass
+
 PARAMS = dict(objective="binary:logistic", eval_metric="logloss", tree_method="hist", max_depth=10,
               learning_rate=0.1, subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
               reg_lambda=1.0, max_bin=256)
@@ -30,28 +34,34 @@ def feature_cols(df: pd.DataFrame):
     return [c for c in df.columns if c not in NON_FEATURES]
 
 
+KEYS = ("ri", "si")
+
+
 def aligned_batches(paths, batch_rows: int = 5_000_000, columns=None):
     """Yield DataFrames of exactly batch_rows rows (last one shorter) with the columns of all row-aligned
-    parquet files side by side. columns: optional set of names to read (others skipped)."""
+    parquet files side by side. Every file must carry the pair keys (ri, si); they are compared batch by
+    batch, so files whose rows are permuted or come from a different candidate set fail loudly.
+    columns: optional set of names to read (the keys are always read)."""
     files = [pq.ParquetFile(p) for p in paths]
     n = files[0].metadata.num_rows
     if any(f.metadata.num_rows != n for f in files):
         raise ValueError(f"feature files are not row-aligned: {[f.metadata.num_rows for f in files]}")
-    seen = set()
+    for p, f in zip(paths, files):
+        if not set(KEYS) <= set(f.schema_arrow.names):
+            raise ValueError(f"{p}: missing pair keys {KEYS}; rebuild it with the current code")
+    seen = set(KEYS)
     cols = []
     for f in files:
         c = [x for x in f.schema_arrow.names if x not in seen and (columns is None or x in columns)]
         seen.update(c)
-        cols.append(c)
-    its = [f.iter_batches(batch_size=batch_rows, columns=c) if c else None for f, c in zip(files, cols)]
+        cols.append(list(KEYS) + c)
+    its = [f.iter_batches(batch_size=batch_rows, columns=c) for f, c in zip(files, cols)]
     bufs = [[] for _ in files]
     have = [0] * len(files)
     for start in range(0, n, batch_rows):
         need = min(batch_rows, n - start)
         parts = []
         for j, it in enumerate(its):
-            if it is None:
-                continue
             while have[j] < need:
                 b = next(it)
                 bufs[j].append(b)
@@ -61,6 +71,12 @@ def aligned_batches(paths, batch_rows: int = 5_000_000, columns=None):
             rest = t.slice(need)
             bufs[j] = rest.to_batches() if rest.num_rows else []
             have[j] -= need
+        for j in range(1, len(parts)):
+            for k in KEYS:
+                if not np.array_equal(parts[0][k].values, parts[j][k].values):
+                    raise ValueError(f"{paths[j]}: pair keys differ from {paths[0]} in rows "
+                                     f"{start}..{start + need} — feature files are not row-aligned")
+            parts[j] = parts[j].drop(columns=list(KEYS))
         yield pd.concat(parts, axis=1)
 
 
@@ -72,6 +88,36 @@ def select_rows(paths, keep: np.ndarray, columns=None, batch_rows: int = 5_000_0
             out.append(df[m])
         a += len(df)
     return pd.concat(out, ignore_index=True)
+
+
+def feature_names(paths):
+    """Feature columns of the row-aligned files, in file order (keys, labels and duplicates excluded)."""
+    seen, cols = set(), []
+    for p in paths:
+        for c in pq.ParquetFile(p).schema_arrow.names:
+            if c not in NON_FEATURES and c not in seen:
+                seen.add(c)
+                cols.append(c)
+    return cols
+
+
+def select_matrices(paths, masks, batch_rows: int = 5_000_000):
+    """One pass over the feature files; for each boolean row mask, a preallocated float32 matrix of the selected
+    rows. Memory ~ the selected rows only (no DataFrame copies or concatenation)."""
+    cols = feature_names(paths)
+    mats = [np.empty((int(m.sum()), len(cols)), dtype=np.float32) for m in masks]
+    pos = [0] * len(masks)
+    a = 0
+    for df in aligned_batches(paths, batch_rows, set(cols)):
+        for j, m in enumerate(masks):
+            mm = m[a:a + len(df)]
+            k = int(mm.sum())
+            if k:
+                mats[j][pos[j]:pos[j] + k] = df.loc[mm, cols].to_numpy(dtype=np.float32)
+                pos[j] += k
+        a += len(df)
+    assert all(p == len(x) for p, x in zip(pos, mats))
+    return mats, cols
 
 
 def read_ids(path):
@@ -88,17 +134,16 @@ def train_one(paths, keep, si, y, neg_rate, rounds, device, seed, params, es_fra
     """Train on the kept rows. With es_frac > 0, rows of a held-out fraction of the training S1s form the
     early-stopping set (never the evaluated fold); the booster is truncated at the best iteration."""
     va = keep & es_holdout(si, es_frac) if es_frac > 0 else np.zeros_like(keep)
-    d = select_rows(paths, keep | va)
-    is_va = va[keep | va]
-    cols = feature_cols(d)
-    w = np.where(d.y.values == 1, 1.0, 1.0 / neg_rate).astype(np.float32)
-    tr = ~is_va
-    dm = xgb.QuantileDMatrix(d.loc[tr, cols], label=d.y.values[tr], weight=w[tr], max_bin=params["max_bin"])
+    tr = keep & ~va
+    (Xtr, Xva), cols = select_matrices(paths, [tr, va])
+    wt = lambda yy: np.where(yy == 1, 1.0, 1.0 / neg_rate).astype(np.float32)
+    dm = xgb.QuantileDMatrix(Xtr, label=y[tr], weight=wt(y[tr]), max_bin=params["max_bin"], feature_names=cols)
+    del Xtr
     evals, kw = [], {}
-    if is_va.any():
-        dv = xgb.QuantileDMatrix(d.loc[is_va, cols], label=d.y.values[is_va], weight=w[is_va], ref=dm)
+    if len(Xva):
+        dv = xgb.QuantileDMatrix(Xva, label=y[va], weight=wt(y[va]), ref=dm, feature_names=cols)
         evals, kw = [(dv, "es")], {"early_stopping_rounds": es_rounds, "verbose_eval": False}
-    del d
+    del Xva
     bst = xgb.train({**params, "device": device, "seed": seed}, dm, num_boost_round=rounds, evals=evals, **kw)
     if evals:
         bst = bst[: bst.best_iteration + 1]
@@ -106,14 +151,22 @@ def train_one(paths, keep, si, y, neg_rate, rounds, device, seed, params, es_fra
 
 
 def oof(paths, out: Path, model_dir: Path, n_folds: int, neg_rate: float, rounds: int, devices, params=None,
-        es_frac: float = 0.0):
+        es_frac: float = 0.0, upstream: str | None = None):
+    """upstream: fingerprint of the training features; fold models left from a run with a different
+    configuration or different features are refused instead of being reused."""
     params = {**PARAMS, **(params or {})}
     t = time.time()
     ri, si, y = read_ids(paths[0])
     fold = fold_of(si, n_folds)
     model_dir.mkdir(parents=True, exist_ok=True)
-    json.dump({"n_folds": n_folds, "neg_rate": neg_rate, "rounds": rounds, "es_frac": es_frac, "params": params},
-              open(model_dir / "model_config.json", "w"), indent=1)
+    cfg = {"n_folds": n_folds, "neg_rate": neg_rate, "rounds": rounds, "es_frac": es_frac, "params": params,
+           "features": upstream}
+    cfg_path = model_dir / "model_config.json"
+    if cfg_path.exists() and json.load(open(cfg_path)) != json.loads(json.dumps(cfg)):
+        raise StaleModels(f"{model_dir} holds models of a different configuration; use a new --work")
+    if not cfg_path.exists() and any(model_dir.glob("xgb_fold*")):
+        raise StaleModels(f"{model_dir} holds fold models without a configuration; use a new --work")
+    json.dump(cfg, open(cfg_path, "w"), indent=1)
     errors = []
 
     def run(k):
@@ -153,8 +206,12 @@ def oof(paths, out: Path, model_dir: Path, n_folds: int, neg_rate: float, rounds
 def load_boosters(model_dir: Path, device):
     files = sorted([f for f in Path(model_dir).glob("xgb_fold*") if f.suffix in (".ubj", ".json")],
                    key=lambda f: int(f.stem[len("xgb_fold"):]))
-    if not files or len({f.stem for f in files}) != len(files):
-        raise FileNotFoundError(f"need exactly one xgb_fold<k>.ubj|.json per fold in {model_dir}: {files}")
+    ks = [int(f.stem[len("xgb_fold"):]) for f in files]
+    cfg_path = Path(model_dir) / "model_config.json"
+    expected = json.load(open(cfg_path))["n_folds"] if cfg_path.exists() else len(files)
+    if ks != list(range(expected)):
+        raise StaleModels(f"{model_dir}: need exactly one xgb_fold<k>.ubj|.json for k = 0..{expected - 1}, "
+                          f"found {[f.name for f in files]}")
     out = []
     for f in files:
         bst = xgb.Booster(model_file=str(f))
@@ -167,11 +224,15 @@ def predict(paths, out: Path, model_dir: Path, devices, batch_rows: int = 5_000_
     """Average of the fold models; feature files are streamed in batches to bound memory."""
     boosters = load_boosters(model_dir, devices[0])
     need = set(boosters[0].feature_names) | {"ri", "si"}
-    parts = []
-    for df in aligned_batches(paths, batch_rows, need):
+    tmp = Path(out).with_suffix(".tmp.parquet")
+    writer = None
+    for df in aligned_batches(paths, batch_rows, need):         # each batch is written out: memory ~ one batch
         p = np.mean([b.inplace_predict(df[b.feature_names]) for b in boosters], axis=0).astype(np.float32)
-        parts.append(pd.DataFrame({"ri": df.ri.values, "si": df.si.values, "p": p}))
-    pd.concat(parts, ignore_index=True).to_parquet(out, index=False)
+        t = pa.Table.from_pandas(pd.DataFrame({"ri": df.ri.values, "si": df.si.values, "p": p}), preserve_index=False)
+        writer = writer or pq.ParquetWriter(tmp, t.schema)
+        writer.write_table(t)
+    writer.close()
+    tmp.rename(out)
 
 
 def main():

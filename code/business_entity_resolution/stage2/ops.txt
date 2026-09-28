@@ -1,0 +1,1 @@
+o_nins,o_ndel,o_nsub,o_ins_novel,o_ins_qmax,o_ins_qmin,o_ins_lastmax,o_ins_firstmax,o_del_qmax,o_del_qmin,o_del_lastmax,o_del_firstmax,o_ins_at_end,o_ins_at_start,o_del_s1last,o_ins_frac,o_del_frac,o_order_swap

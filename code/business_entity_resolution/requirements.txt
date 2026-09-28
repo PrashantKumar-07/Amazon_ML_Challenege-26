@@ -11,3 +11,7 @@ rapidfuzz==3.14.5
 sparse-dot-topn==1.2.0
 xgboost==3.2.0
 anyascii==0.3.3
+polars==1.44.2
+# stage-2 only (cross-encoder fine-tuning / scoring in stage2/ce/):
+transformers==5.17.0
+tokenizers==0.23.2

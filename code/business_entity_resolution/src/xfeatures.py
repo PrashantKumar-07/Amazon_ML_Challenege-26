@@ -37,8 +37,12 @@ DIG_COLS = ["dz_rex", "dz_rtr", "dz_rnear", "dz_rnone", "dz_sex", "hn_rel", "hn_
 NAME_COLS = ["n_cov_s", "n_excov_s", "n_cov_r", "n_excov_r", "n_unm_s_maxidf", "n_unm_r_maxidf", "n_unm_s_cnt",
              "n_unm_r_cnt", "core_ratio", "core_tset", "core_eq", "core_first_eq", "ocr_ratio", "n_idf_sum_s"]
 ADDR_COLS = ["a_cov_s", "a_cov_r", "a_excov_s", "a_unm_s_maxidf"]
-COLS = ["x_" + c for c in DIG_COLS + NAME_COLS + ADDR_COLS]
-CTX = ("x_n_cov_s", "x_dz_rex", "x_a_cov_s", "x_hn_eqz")   # record-side gap/rank context (density-invariant)
+# v2 additions: abbreviation-aware coverage, number specificity learned from S1 (no positional "house number"
+# assumption), exact coverage on raw (non-OCR-folded) tokens
+V2_COLS = ["n_abcov_s", "n_abcov_r", "a_abcov_s", "a_abcov_r", "nz_idfcov_r", "nz_idfcov_s", "nz_rare_rel",
+           "nz_rare_logdiff", "n_rawexcov_s"]
+COLS = ["x_" + c for c in DIG_COLS + NAME_COLS + ADDR_COLS + V2_COLS]
+CTX = ("x_n_cov_s", "x_dz_rex", "x_a_cov_s", "x_hn_eqz", "x_n_abcov_s", "x_nz_idfcov_r")  # record-side context
 
 G = {}
 
@@ -49,15 +53,19 @@ def ocr_tok(t: str) -> str:
 
 
 def country_stats(names: np.ndarray, addrs: np.ndarray) -> dict:
-    """IDF of name/address tokens and the frequent-name-token set, from one country's S1 table."""
+    """IDF of name/address tokens and of address numbers (a number shared by many S1 addresses, e.g. a
+    postcode, is weak evidence) and the frequent-name-token set, from one country's S1 table."""
     n = len(names)
-    cn, ca = Counter(), Counter()
+    cn, ca, cd = Counter(), Counter(), Counter()
     for s in names:
         cn.update({ocr_tok(t) for t in s.split()})
     for s in addrs:
-        ca.update({t for t in s.split() if not t.isdigit()})
+        toks = s.split()
+        ca.update({t for t in toks if not t.isdigit()})
+        cd.update({_dnum(t) for t in toks if t.isdigit()})
     return {"idf_n": {k: math.log(n / v) for k, v in cn.items()},
             "idf_a": {k: math.log(n / v) for k, v in ca.items()},
+            "idf_d": {k: math.log(n / v) for k, v in cd.items()},
             "dflt": math.log(n),
             "stop": {k for k, v in cn.items() if v >= max(STOP_DF * n, STOP_MIN) or len(k) == 1}}
 
@@ -68,6 +76,47 @@ def _init(stats):
 
 def _tok_match(a, b):
     return len(a) >= 4 and len(b) >= 4 and Levenshtein.normalized_similarity(a, b) >= FUZZY_SIM
+
+
+def _is_abbrev(a, b):
+    """a abbreviates b: >= 2 letters, same first letter, a's letters appear in order in the longer b."""
+    if len(a) < 2 or len(a) >= len(b) or a[0] != b[0] or not a.isalpha():
+        return False
+    it = iter(b)
+    return all(c in it for c in a)
+
+
+def abbrev_cover(A, B, idf, dflt):
+    """IDF mass of A covered by B counting exact (1), fuzzy and abbreviation matches (FUZZY_W) either way."""
+    tot = cov = 0.0
+    Bs = set(B)
+    for t in A:
+        w = idf.get(t, dflt)
+        tot += w
+        if t in Bs:
+            cov += w
+        elif any(_tok_match(t, u) or _is_abbrev(t, u) or _is_abbrev(u, t) for u in B):
+            cov += FUZZY_W * w
+    return cov / tot if tot else math.nan
+
+
+def number_feats(rd, sd, idf_d, dflt):
+    """Numbers weighted by how specific they are in the country's S1 addresses (learned IDF); relation of the
+    S1's most specific number to the record's closest number. No assumption about which position is what."""
+    R = [_dnum(t) for t in rd.split()]
+    S = [_dnum(t) for t in sd.split()]
+    if not R or not S:
+        return [math.nan] * 4
+    Rs, Ss = set(R), set(S)
+    wr = [idf_d.get(t, dflt) for t in R]
+    ws = [idf_d.get(t, dflt) for t in S]
+    cov_r = sum(w for t, w in zip(R, wr) if t in Ss) / max(sum(wr), 1e-9)
+    cov_s = sum(w for t, w in zip(S, ws) if t in Rs) / max(sum(ws), 1e-9)
+    rare = S[int(np.argmax(ws))]
+    rels = [_num_rel(rare, t) for t in R]
+    rel = min(rels)
+    diffs = [abs(int(rare[:12]) - int(t[:12])) for t in R if len(t) == len(rare)]
+    return [cov_r, cov_s, float(rel), math.log1p(min(diffs)) if diffs else math.nan]
 
 
 def soft_cover(A, B, idf, dflt):
@@ -137,7 +186,7 @@ def digit_feats(rd, sd):
 
 def pair_block(args):
     rn, sn, ra, sa, rd, sd = args
-    idf_n, idf_a, dflt, stop = G["idf_n"], G["idf_a"], G["dflt"], G["stop"]
+    idf_n, idf_a, idf_d, dflt, stop = G["idf_n"], G["idf_a"], G["idf_d"], G["dflt"], G["stop"]
     out = np.full((len(rn), len(COLS)), np.nan, dtype=np.float32)
     for i in range(len(rn)):
         row = digit_feats(rd[i], sd[i])
@@ -160,6 +209,14 @@ def pair_block(args):
             row += [ac_s, ac_r, ae_s, amx]
         else:
             row += [math.nan] * 4
+        # v2
+        row += [abbrev_cover(Sc, Rc, idf_n, dflt), abbrev_cover(Rc, Sc, idf_n, dflt)]
+        row += [abbrev_cover(SA, RA, idf_a, dflt), abbrev_cover(RA, SA, idf_a, dflt)] if RA and SA else [math.nan] * 2
+        row += number_feats(rd[i], sd[i], idf_d, dflt)
+        Sraw = [t for t in sn[i].split() if ocr_tok(t) not in stop]
+        Rraw = set(rn[i].split())
+        tot = sum(idf_n.get(ocr_tok(t), dflt) for t in Sraw)
+        row.append(sum(idf_n.get(ocr_tok(t), dflt) for t in Sraw if t in Rraw) / tot if tot else math.nan)
         out[i] = row
     return out
 
@@ -172,6 +229,9 @@ def compute(ri, si, s1: pd.DataFrame, recs: pd.DataFrame, stats: dict, workers: 
     with Pool(workers, initializer=_init, initargs=(stats,)) as pool:
         X = np.vstack(list(pool.imap(pair_block, tasks, chunksize=1)))
     F = pd.DataFrame(X, columns=COLS)
+    F.insert(0, "ri", ri)                               # pair keys: row alignment is verified downstream
+    F.insert(1, "si", si)
+    F["x_r_map_cov"] = recs.map_cov.values[ri]
     for c in CTX:
         v = np.nan_to_num(F[c].values, nan=-1.0)
         g, r, _ = _gap_to_best_other(ri, v)
@@ -179,12 +239,27 @@ def compute(ri, si, s1: pd.DataFrame, recs: pd.DataFrame, stats: dict, workers: 
     return F
 
 
+def map_coverage(raw_names, nonlatin, map_path: Path) -> np.ndarray:
+    """Share of a record's non-Latin tokens covered by the learned token map (NaN for Latin-only names)."""
+    from .token_map import load, raw_tokens
+    from .normalize import has_non_latin
+    tmap = load(map_path) if map_path.exists() else {}
+    out = np.full(len(raw_names), np.nan, dtype=np.float32)
+    for i in np.flatnonzero(nonlatin):
+        toks = [t for t in raw_tokens(raw_names[i]) if has_non_latin(t)]
+        if toks:
+            out[i] = sum(t in tmap for t in toks) / len(toks)
+    return out
+
+
 def build(cache: Path, split: str, cands: Path, out: Path, workers: int):
     t = time.time()
     cols = ["name", "addr", "addr_digits", "country"]
     s1 = pd.read_parquet(cache / f"{split}_s1.parquet", columns=cols)
-    recs = pd.concat([pd.read_parquet(cache / f"{split}_s{s}.parquet", columns=cols[:3]) for s in (2, 3)],
-                     ignore_index=True)
+    recs = pd.concat([pd.read_parquet(cache / f"{split}_s{s}.parquet", columns=cols[:3] + ["name_raw", "name_nonlatin"])
+                      for s in (2, 3)], ignore_index=True)
+    recs["map_cov"] = map_coverage(recs.name_raw.values, recs.name_nonlatin.values, cache / "token_map.json")
+    recs.drop(columns=["name_raw"], inplace=True)
     C = pd.read_parquet(cands, columns=["ri", "si"])
     ri, si = C.ri.values, C.si.values
     cty = s1.country.values[si]

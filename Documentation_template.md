@@ -11,17 +11,23 @@
 We cast the task as **record-side assignment**. Each Source 2 / Source 3 record belongs to at most one
 Source 1 entity, so the pipeline retrieves candidate S1 entities for every record, scores each (record, S1)
 pair with a gradient-boosted classifier, and assigns each record to its best S1 if the match probability
-clears a threshold. Four components carry most of the result:
+clears a threshold. Five components carry most of the result:
 - a **cross-script token map learned from the training pairs**, which maps Indic-script names to their
   Latin form;
 - **GPU-accelerated exact TF-IDF blocking** on name + address;
 - **token-level features** (IDF-weighted token coverage, number relations with leading zeros stripped,
   near-miss house numbers), learned per country from S1 data, which recognise near-miss distractors;
+- a **stage-2 rescoring** on the hard pairs (stage-1 p ≥ 0.003 filter): 18 edit-operation name features +
+  two fine-tuned cross-encoders (multilingual-e5-small and xlm-roberta-base, both MIT) with record-side
+  gap/rank context;
+- a **house-number gate for the unseen country** (France): same-number → 0.65, disjoint numbers → 0.95,
+  else 0.8 (inserted "and" at the same number → 0.5).
 - a **validation protocol that reproduces the leaderboard**: models and decision rules are chosen on a
   distractor-density simulation and a leave-one-country-out split, not on plain out-of-fold scores.
 
-Macro F0.5 on the training data: **0.9872** out-of-fold, **0.9863** under test-like distractor density,
-**0.9521** when predicting a country never seen in training.
+Macro F0.5 on the training data (stage-1): **0.9872** out-of-fold, **0.9863** under test-like distractor
+density, **0.9521** when predicting a country never seen in training. Stage-2 in-country: **0.9904**.
+Public leaderboard of the shipped v8 file: **0.990**.
 
 ---
 
@@ -140,7 +146,7 @@ n-grams (`max_df`) was rejected because it cost 2 pp of India recall.
 
 ## 4. Matching Model
 
-**Features used (75 per pair):**
+**Features used (89 per pair for stage-1; 113 for stage-2):**
 
 *String and context features (38):*
 - **Name:** rapidfuzz ratio, token-set ratio, token-sort ratio, partial ratio, Jaro-Winkler; partial
@@ -155,7 +161,8 @@ n-grams (`max_df`) was rejected because it cost 2 pp of India recall.
   number of candidates. This captures one-to-one competition between name twins.
 - **Other:** whether the name was mapped from a non-Latin script, and the source (S2/S3).
 
-*Token-level features (37, `xfeatures.py`):*
+*Token-level features (37 + v2 9 + map coverage + record-side context, `xfeatures.py`; 89 total with the
+38 above):*
 - **Name coverage:** IDF-weighted share of the S1's name tokens found in the record and vice versa, exact
   and fuzzy (normalised Levenshtein ≥ 0.75 for tokens of ≥ 4 characters); number and maximum IDF of
   uncovered tokens (a distinctive extra word signals a different business).
@@ -171,15 +178,28 @@ n-grams (`max_df`) was rejected because it cost 2 pp of India recall.
   own statistics. No hand-written word lists and no target encoding of tokens.
 - There is no country-identity feature.
 
-**Model type:**
+*Stage-2 features (+24, `stage2/`, 113 total):*
+- **Edit-operation name features (18, `ops.txt`):** inserted/deleted/substituted token counts typed by
+  country-invariant frequency percentiles, first/last-position rates, novelty and order swaps.
+- **Cross-encoder features (6):** multilingual-e5-small (MIT, 118M) and xlm-roberta-base (MIT, 278M)
+  logits plus record-side gap/rank context for each. Each CE is fine-tuned 1 epoch on 2 S1-hash folds
+  for out-of-fold features; test uses the mean of the two fold logits.
+
+**Model type (stage-1):**
 - XGBoost binary classifier (GPU `hist`, max depth 10, learning rate 0.05, subsample and colsample 0.8,
   min child weight 5).
 - 5-fold cross-validation grouped by S1 entity, all positives and 50% of negatives with inverse-rate
   weights. The number of trees is set per fold by early stopping (patience 50, at most 3000) on a
   hash-selected 5% of the *training* S1 entities, never on the evaluated fold: 1977–2299 trees.
 - Test predictions average the five fold models.
-- XGBoost is Apache-2.0. No pretrained neural model is used, so the total parameter count is far below
-  8B.
+- XGBoost is Apache-2.0. The cross-encoders are MIT (118M + 278M ≈ 0.4B total, limit 8B).
+  No other pretrained neural model is used.
+
+**Model type (stage-2):**
+- XGBoost binary classifier (same hyper-params), 5-fold grouped by S1, trained on the hard pairs only
+  (stage-1 p ≥ 0.003 filter; stage-1 p is never a feature). `capop` = 89 + 18 (no CE); `capxr` =
+  89 + 18 + 6 (full). Test predictions average the five fold models; the shipped decision blends them
+  (seen countries: 0.5·capce + 0.5·capxr @ 0.75; unseen: 0.6·capop + 0.4·capxr with the house-number gate).
 
 **How the configuration was selected (no overfitting to one validation set):**
 
@@ -224,6 +244,15 @@ J is flat between 0.775 and 0.85; **t = 0.80** was chosen (tied with 0.825 withi
 and drop19). The expected-F0.5 set-size rule of our first submission was dropped: it sizes each S1's set
 from the summed probability of all its candidates, which extra distractors inflate.
 
+**Stage-2 / final decision (v8, `stage2/combine8b.py`).** CE features help training-seen countries
+(+0.0017 in/clone) but hurt unseen ones (−0.0047 LOCO, singleton F −0.05: the stacked GBDT over-trusts a
+CE that transfers poorly) → hybrid: CE for seen, no-CE for unseen (J 0.98476). The unseen logit blend
+0.6·capop + 0.4·capxr adds +0.0127 LOCO. The house-number gate (shared number → 0.65, disjoint numbers →
+0.95, else 0.8; inserted "and" at the same number → 0.5) adds a further +0.0013 LOCO and +0.005 LB on
+France, where same-number pairs are near-certain true matches (99.6–99.8%) and disjoint-number pairs are
+distractors. Final: seen 0.5·(capce+capxr) @ 0.75; unseen blend64 with the gate. A stronger gate
+(T_eq 0.5, T_ne 0.98) scores lower (v9 LB 0.984 < v8 0.990), so v8 is the optimum.
+
 ---
 
 ## 5. Results & Error Analysis
@@ -237,9 +266,13 @@ from the summed probability of all its candidates, which extra distractors infla
   | 19% S1 removed (drop19) | 0.9736 | **0.9854** |
   | unseen country (leave-one-country-out) | 0.9251 | **0.9521** |
 
-  - Final out-of-fold (threshold 0.80): US 0.9877, India 0.9865; singletons 0.9893, matched entities 0.9871;
+  - Final out-of-fold (stage-1, threshold 0.80): US 0.9877, India 0.9865; singletons 0.9893, matched entities 0.9871;
     wrong matches per S1 0.0085 (0.0143 under test-like density).
-  - Public leaderboard: first submission 0.969; stacked model 0.965 (rejected, see §4); final: [to be filled].
+  - Public leaderboard: v1 0.969; stacked model 0.965 (rejected, see §4); v4 0.979; v5 0.983; v6 0.985;
+    v7 0.984 (rejected: XLM-R for seen countries); **v8 0.990 (shipped)**; v9 0.984 (rejected: stronger gate).
+  - Shipped v8 file: 5,865,431 matches, 98,671 empty S1 (5.69%); France 3.4357/S1 empty 5.21% (259,452 S1),
+    India 3.3699 empty 5.80% (809,986), US 3.3848 empty 5.76% (663,106). Validator PASS with `--check-ids`
+    (`candidate_pairs.tsv` excluded from git, 2.3 GB > 100 MB limit, regenerated by the pipeline).
 - **Where the remaining loss is** (out-of-fold, before the final tuning; shares of the total loss):
   - 62% partial recall: true records scored below the threshold at correctly matched S1s;
   - 18% matched S1 left empty;
@@ -266,7 +299,9 @@ model can win out-of-fold and still lose on test. Building a validation set that
 matched both of our leaderboard scores), then choosing features, K, regularisation and the threshold on it
 together with a leave-one-country-out split, led to token-level near-miss features and a plain threshold.
 That gave 0.987 out-of-fold and 0.986 under test-like density, with the density penalty cut from 0.006 to
-0.001.
+0.001. A second stage on the hard pairs (edit-operation + cross-encoder features, CE only where the
+country was seen in training) plus a house-number gate for the unseen country lifted the public
+leaderboard from 0.979 to **0.990**.
 
 ---
 
@@ -278,18 +313,24 @@ That gave 0.987 out-of-fold and 0.986 under test-like density, with the density 
 
 - `src/pipeline.py`: the entry point. Run it as
   `python -m src.pipeline --mode full|inference --data-dir <dataset> --work <dir> --out <dir> --gpus cuda:0`.
-  The selected configuration is pinned there (`MODEL`, `DECISION`).
+  The selected configuration is pinned there (`MODEL`, `DECISION`). Stage fingerprints are stored in
+  `<out>.meta.json` (`src/fingerprint.py`); stale caches raise instead of reusing.
 - `src/preprocess.py`, `normalize.py`, `token_map.py`: normalisation and the learned script map.
 - `src/blocking.py`: candidate generation (GPU exact TF-IDF top-k, with a CPU fallback).
 - `src/features.py`: string and context features; `src/xfeatures.py`: token-level features.
 - `src/model.py`: XGBoost K-fold OOF training with early stopping, and streaming prediction.
 - `src/decide.py`: one-to-one assignment and decision rules.
 - `src/evaluate.py`: the local macro-F0.5 scorer.
-- `tests/`: 25 pytest cases, covering every stage plus an end-to-end run on synthetic data with extreme
-  cases. The synthetic data has a test-only country, a country with one S1, S1 without records, empty
+- `tests/`: 33 pytest cases, covering every stage plus end-to-end runs on synthetic data with extreme
+  cases and edge cases (empty predictions, all-p-below-minimum, no accepted matches, empty context,
+  singleton-only ground truth). The synthetic data has a test-only country, a country with one S1, S1 without records, empty
   records and non-Latin names; the result is checked by the official validator. The e2e case runs on CPU
-  and on GPU.
-- `artifacts/`: fold models, token map and decision rule, enough for inference without retraining.
+  and on GPU; inference from artifacts reproduces the full-mode output byte-for-byte.
+- `stage2/`: rescoring to the final file — `opfeats.py` (18 edit-operation features), `ce/ce.py`
+  (cross-encoder fine-tune + score), `final.py` (stage-2 XGBoost), `combine8b.py` (v8 decision:
+  `python combine8b.py OUT v8inus 0.75 blend64 0.8 0.65 0.95 0.5`). CE checkpoints (~6 GB) are not in
+  git; retrain from the HF bases. `requirements.txt` pins `transformers`/`tokenizers`/`polars` for this stage.
+- `artifacts/`: stage-1 fold models, token map and decision rule, enough for stage-1 inference without retraining.
 - `README.md` gives exact run and validation commands; `requirements.txt` pins versions.
 
 ### B. Additional Results

@@ -49,16 +49,21 @@ def load_tables(cache: Path, split: str):
 def labels(recs: pd.DataFrame, s1: pd.DataFrame, gt_path: Path) -> np.ndarray:
     """rec row -> true S1 row (-1 if unmatched)."""
     gt = read_ground_truth(gt_path)
-    s1pos = pd.Series(np.arange(len(s1)), index=s1.id)
-    rid, sid = zip(*[(r, s) for s, lst in gt.items() for r in lst])
-    rpos = pd.Series(np.arange(len(recs)), index=recs.id)
     out = np.full(len(recs), -1, dtype=np.int32)
+    pairs = [(r, s) for s, lst in gt.items() for r in lst]
+    if not pairs:                                   # ground truth with singletons only
+        return out
+    rid, sid = zip(*pairs)
+    s1pos = pd.Series(np.arange(len(s1)), index=s1.id)
+    rpos = pd.Series(np.arange(len(recs)), index=recs.id)
     out[rpos.reindex(list(rid)).values] = s1pos.reindex(list(sid)).values
     return out
 
 
 def _gap_to_best_other(key: np.ndarray, val: np.ndarray):
     """For each row: val - max(val of other rows with the same key); rank of val within key (0=best)."""
+    if len(key) == 0:
+        return np.zeros(0, np.float32), np.zeros(0, np.int32), np.zeros(0, np.int32)
     order = np.lexsort((-val, key))
     k, v = key[order], val[order]
     start = np.r_[True, k[1:] != k[:-1]]
